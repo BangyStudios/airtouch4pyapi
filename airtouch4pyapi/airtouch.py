@@ -146,6 +146,7 @@ class AirTouch:
     
     async def isOpen(self, ip, port):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
         try:
             s.connect((ip, int(port)))
             s.shutdown(2)
