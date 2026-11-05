@@ -74,15 +74,65 @@ async def SendMessagePacketToAirtouch(messageString, ipAddress, atVersion, atPor
         messageString = "555555aa" + messageString + format(crc16(bytes.fromhex(messageString)), '08x')[4:]
     else:
         messageString = "5555" + messageString + format(crc16(bytes.fromhex(messageString)), '08x')[4:]
-    BUFFER_SIZE = 4096
     #hexdump(bytearray.fromhex(messageString)) # for debugging
-    reader, writer = await asyncio.open_connection(ipAddress, atPort)
-    writer.write(bytearray.fromhex(messageString))
-    response = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=2.0)
-    writer.close()
-    await writer.wait_closed()
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(ipAddress, atPort), timeout=TIMEOUT_SECONDS)
+    try:
+        writer.write(bytearray.fromhex(messageString))
+        await writer.drain()
+        response = await asyncio.wait_for(ReadFrame(reader, atVersion), timeout=TIMEOUT_SECONDS)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
     #hexdump(response) # for debugging
     return response;
+
+TIMEOUT_SECONDS = 2.0
+BUFFER_SIZE = 4096
+# Bytes before the data block: header + address(2) + message id(1) + message type(1) + data length(2)
+HEADER_LENGTH = {4: 2 + 6, 5: 4 + 6}
+CRC_LENGTH = 2
+
+async def ReadFrame(reader, atVersion):
+    """Read until a whole frame (header, declared data length and CRC) has arrived.
+
+    A single read() can return a partial frame when the response spans several TCP segments,
+    which previously got decoded as if it were complete.
+    """
+    headerLength = HEADER_LENGTH[atVersion.value]
+    response = b""
+    while True:
+        chunk = await reader.read(BUFFER_SIZE)
+        if not chunk:
+            return response  # connection closed; caller validates what we have
+        response += chunk
+        if len(response) >= headerLength:
+            dataLength = int.from_bytes(response[headerLength - 2:headerLength], byteorder='big')
+            if len(response) >= headerLength + dataLength + CRC_LENGTH:
+                return response
+
+def ValidateAt4Frame(frame):
+    """Return the data block of an AirTouch 4 frame, or raise ValueError if the frame is malformed.
+
+    Frame layout: 0x5555 | address(2) | id(1) | type(1) | length(2) | data(length) | crc16(2).
+    The CRC covers everything after the 0x5555 header up to the end of data.
+    """
+    headerLength = HEADER_LENGTH[4]
+    if len(frame) < headerLength + CRC_LENGTH:
+        raise ValueError(f"frame too short ({len(frame)} bytes): {frame.hex()}")
+    if frame[0:2] != b'\x55\x55':
+        raise ValueError(f"bad header: {frame.hex()}")
+    dataLength = int.from_bytes(frame[headerLength - 2:headerLength], byteorder='big')
+    frameLength = headerLength + dataLength + CRC_LENGTH
+    if len(frame) < frameLength:
+        raise ValueError(f"truncated frame (got {len(frame)} of {frameLength} bytes): {frame.hex()}")
+    crcExpected = int.from_bytes(frame[headerLength + dataLength:frameLength], byteorder='big')
+    crcActual = int(crc16(frame[2:headerLength + dataLength]))
+    if crcExpected != crcActual:
+        raise ValueError(f"CRC mismatch (expected {crcExpected:04x}, got {crcActual:04x}): {frame.hex()}")
+    return frame[headerLength:headerLength + dataLength]
 
 import numpy as np
 

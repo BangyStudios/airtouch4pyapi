@@ -118,11 +118,11 @@ class AirTouch:
             #get the group nicknames 
             await self.UpdateGroupNames()
             
+            #get ac abilities first: they define which ACs exist, status packets only update them
+            await self.UpdateAcAbility()
+
             #get ac infos
             await self.UpdateAcInfo()
-            
-            #get ac abilities
-            await self.UpdateAcAbility()
 
             #sort out which AC belongs to which zone/group
             self.AssignAcsToGroups()
@@ -383,7 +383,7 @@ class AirTouch:
             if(messageObject.MessageType == "AcAbility"):
                 MESSAGE = "90b0011f0002ff11"
             if(messageObject.MessageType == "AcStatus"): 
-                MESSAGE = "80b0012d0000f4cf"
+                MESSAGE = "80b0012d0000"  # CRC is appended by SendMessagePacketToAirtouch; a hard-coded one here sent it twice
             if(messageObject.MessageType == "GroupControl" or messageObject.MessageType == "AcControl"):
                 MESSAGE = communicate.MessageObjectToMessagePacket(messageObject, messageObject.MessageType, self.atVersion);
         
@@ -421,19 +421,25 @@ class AirTouch:
             return;
         if(self.atVersion == AirTouchVersion.AIRTOUCH4):
 
-            ## AT4 is easy
+            ## AT4 is easy, but only once we know the frame is intact.
+            ## A truncated or corrupted frame decodes into garbage groups/ACs, so reject it outright.
+            try:
+                data = communicate.ValidateAt4Frame(dataResult)
+            except ValueError as e:
+                self.Status = AirTouchStatus.ERROR
+                errorMessage = AirTouchError()
+                errorMessage.Message = "Discarded invalid response from airtouch: " + str(e)
+                self.Messages.append(errorMessage)
+                return
 
-            address = dataResult[2:4]
-            messageId = dataResult[4:5]
             messageType = dataResult[5:6]
-            dataLength = dataResult[6:8]
 
             if(messageType == b'\x2b'):
-                self.DecodeAirtouchGroupStatusMessage(dataResult[8::]);
+                self.DecodeAirtouchGroupStatusMessage(data);
             if(messageType == b'\x1f'):
-                self.DecodeAirtouchExtendedMessage(dataResult[8::]);
+                self.DecodeAirtouchExtendedMessage(data);
             if(messageType == b'\x2d'):
-                self.DecodeAirtouchAcStatusMessage(dataResult[8::]);
+                self.DecodeAirtouchAcStatusMessage(data);
         else:
 
             ## AT5 requires a bit more knowledge if it's an extended message.  
@@ -480,7 +486,7 @@ class AirTouch:
             self.DecodeAirtouchMessage(payload[2:], packetmap.DataLocationTranslator.map[self.atVersion.value]["AcAbility"], False, chunkSize + 2)
 
     ## Only for AT4, decode a basic message.  
-    def DecodeAirtouchMessage(self, payload, map, isGroupBased, chunkSize):
+    def DecodeAirtouchMessage(self, payload, map, isGroupBased, chunkSize, createAcs = True):
         for chunk in helper.chunks(payload, chunkSize):
             if(len(chunk) < chunkSize):
                 continue
@@ -499,6 +505,9 @@ class AirTouch:
                 resultObject = AirTouchAc()
                 acNumber = communicate.TranslateMapValueToValue(chunk, packetInfoLocationMap["AcNumber"]);
                 if acNumber not in resultList:
+                    if not createAcs:
+                        # Status for an AC that AcAbility never reported: don't invent one
+                        continue
                     resultObject.AcName = "AC " + str(acNumber)
                     resultList[acNumber] = resultObject;
                 else:
@@ -533,7 +542,7 @@ class AirTouch:
 
     ## Only for AT5, get additional details
 
-    def DecodeAirtouch5Message(self, payload, map, isGroupBased):
+    def DecodeAirtouch5Message(self, payload, map, isGroupBased, createAcs = True):
         normalDataLength = int.from_bytes(payload[0:2], byteorder='big')
         repeatDataLength = int.from_bytes(payload[2:4], byteorder='big')
         repeatCount = int.from_bytes(payload[4:6], byteorder='big')
@@ -555,6 +564,9 @@ class AirTouch:
                 resultObject = AirTouchAc()
                 acNumber = communicate.TranslateMapValueToValue(chunk, packetInfoLocationMap["AcNumber"]);
                 if acNumber not in resultList:
+                    if not createAcs:
+                        # Status for an AC that AcAbility never reported: don't invent one
+                        continue
                     resultList[acNumber] = resultObject;
                 else:
                     resultObject = resultList[acNumber];
@@ -645,7 +657,7 @@ class AirTouch:
         self.DecodeAirtouch5Message(payload, packetmap.DataLocationTranslator.map[self.atVersion.value]["GroupStatus"], True);
 
     def DecodeAirtouchAcStatusMessage(self, payload):
-        self.DecodeAirtouchMessage(payload, packetmap.DataLocationTranslator.map[self.atVersion.value]["AcStatus"], False, 8);
+        self.DecodeAirtouchMessage(payload, packetmap.DataLocationTranslator.map[self.atVersion.value]["AcStatus"], False, 8, createAcs = False);
             #read the chunk as a set of bytes concatenated together.
             #use the map of attribute locations
                 #for each entry in the map
@@ -653,7 +665,7 @@ class AirTouch:
                     #run translate on class matching entry name with entry value
                     #set property of entry name on the group response
     def DecodeAirtouch5AcStatusMessage(self, payload):
-        self.DecodeAirtouch5Message(payload, packetmap.DataLocationTranslator.map[self.atVersion.value]["AcStatus"], False);
+        self.DecodeAirtouch5Message(payload, packetmap.DataLocationTranslator.map[self.atVersion.value]["AcStatus"], False, createAcs = False);
     
     def _getTargetGroup(self, groupName):
         return [group for group in self.groups.values() if group.GroupName == groupName][0]
